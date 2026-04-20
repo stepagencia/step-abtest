@@ -197,7 +197,8 @@ class ClickUp:
 # ---------------------------------------------------------------------------
 
 def cf_value(task: dict, field_id: str) -> Any:
-    """Extrai o valor de um custom field da resposta do ClickUp."""
+    """Extrai o valor bruto de um custom field. Retorna None se não existe
+    ou não está preenchido. Cuidado: 0 e "" são valores válidos."""
     for cf in task.get("custom_fields", []):
         if cf["id"] == field_id:
             return cf.get("value")
@@ -206,9 +207,11 @@ def cf_value(task: dict, field_id: str) -> Any:
 
 def dropdown_option_id(task: dict, field_id: str) -> Optional[str]:
     """
-    Para dropdowns, a API retorna o índice da opção em 'value' (int) e
-    a lista de opções em type_config.options. Queremos o orderindex/id
-    da opção selecionada.
+    Para dropdowns, a API retorna o ÍNDICE (int) da opção em 'value' OU o
+    UUID (str) da opção. Queremos sempre devolver o UUID.
+
+    ATENÇÃO: o valor 0 é VÁLIDO (primeira opção, ex: Headline no índice 0).
+    Precisa checar `is None` explicitamente, não `if not value`.
     """
     for cf in task.get("custom_fields", []):
         if cf["id"] != field_id:
@@ -216,43 +219,55 @@ def dropdown_option_id(task: dict, field_id: str) -> Optional[str]:
         val = cf.get("value")
         if val is None:
             return None
-        # Em dropdowns o 'value' já é o orderindex (int) ou o UUID da opção
         options = cf.get("type_config", {}).get("options", [])
         if isinstance(val, int):
             if 0 <= val < len(options):
                 return options[val]["id"]
             return None
         if isinstance(val, str):
-            # Já é o UUID da opção
+            if val == "":
+                return None
             return val
     return None
 
 
-def build_custom_fields_payload(source_task: dict,
-                                extra_tipo_teste_id: Optional[str] = None
-                                ) -> list[dict]:
+def apply_custom_fields(cu: ClickUp, task_id: str, source_task: dict,
+                        extra_tipo_teste_id: Optional[str] = None) -> None:
+    """Preenche os custom fields da tarefa recém-criada, um por um,
+    usando o endpoint /task/{id}/field/{field_id} (que é o método mais
+    confiável do ClickUp para setar campos).
+
+    Copia os CAMPOS COPIÁVEIS da tarefa original.
+    Se extra_tipo_teste_id for dado, também preenche "Tipo de teste".
     """
-    Monta o array de custom_fields para enviar no create_task, copiando
-    todos os CAMPOS COPIÁVEIS da tarefa original.
-    Se extra_tipo_teste_id for dado, adiciona também o campo "Tipo de teste".
-    """
-    out: list[dict] = []
+    # Dropdowns: precisamos do UUID da opção
+    dropdown_fields = {CF_CLIENTE, CF_REDE_SOCIAL, CF_TIPO, CF_EDITORIAS}
+
     for field_id in COPIABLE_FIELDS:
         raw = cf_value(source_task, field_id)
+        # IMPORTANTE: 0 é valor válido em dropdown (primeira opção). Só
+        # consideramos "vazio" se for None ou string vazia.
         if raw is None or raw == "":
             continue
-        # Dropdowns: precisamos passar o UUID da opção, não o índice
-        if field_id in {CF_CLIENTE, CF_REDE_SOCIAL, CF_TIPO, CF_EDITORIAS}:
-            opt_id = dropdown_option_id(source_task, field_id)
-            if opt_id:
-                out.append({"id": field_id, "value": opt_id})
-        else:
-            out.append({"id": field_id, "value": raw})
+
+        try:
+            if field_id in dropdown_fields:
+                opt_id = dropdown_option_id(source_task, field_id)
+                if opt_id:
+                    cu.set_custom_field(task_id, field_id, opt_id)
+            else:
+                # Data, URL, texto: valor bruto mesmo
+                cu.set_custom_field(task_id, field_id, raw)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("    Não consegui preencher campo %s em %s: %s",
+                        field_id, task_id, exc)
 
     if extra_tipo_teste_id:
-        out.append({"id": CF_TIPO_TESTE, "value": extra_tipo_teste_id})
-
-    return out
+        try:
+            cu.set_custom_field(task_id, CF_TIPO_TESTE, extra_tipo_teste_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("    Não consegui preencher 'Tipo de teste' em %s: %s",
+                        task_id, exc)
 
 
 def tag_names(task: dict) -> set[str]:
@@ -330,23 +345,25 @@ def create_test_pair(cu: ClickUp, t1: dict) -> None:
         "name": t2_name,
         "description": description,
         "tags": [TAG_TESTE_AB],
-        "custom_fields": build_custom_fields_payload(t1),
     }
     t2 = cu.create_task(LIST_PLANEJAMENTO, t2_payload)
     t2_id = t2["id"]
     log.info("  Tarefa 2 criada: %s (%s)", t2_id, t2_name)
 
+    # Preenche os campos da Tarefa 2 (sem o "Tipo de teste" — esse é só da T3)
+    apply_custom_fields(cu, t2_id, t1)
+
     # --- Cria Tarefa 3 (na lista Testes A/B) ---
     t3_payload = {
         "name": t3_name,
         "description": description,
-        "custom_fields": build_custom_fields_payload(
-            t1, extra_tipo_teste_id=tipo_teste_id
-        ),
     }
     t3 = cu.create_task(LIST_TESTE_AB, t3_payload)
     t3_id = t3["id"]
     log.info("  Tarefa 3 criada: %s (%s)", t3_id, t3_name)
+
+    # Preenche os campos da Tarefa 3, inclusive o "Tipo de teste"
+    apply_custom_fields(cu, t3_id, t1, extra_tipo_teste_id=tipo_teste_id)
 
     # --- Vincula as três (link bidirecional via /link/{id}) ---
     try:
