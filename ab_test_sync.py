@@ -9,26 +9,37 @@ FLUXO 1 — Detectar novos testes A/B
 
   Para cada uma (Tarefa 1):
     1. Lê os custom fields (Cliente, Rede Social, Tipo, Editorias,
-       Link do Post Original, Data da Postagem, Legenda) e "Tipo de teste".
+       Link do Post, Data da Postagem, Legenda) e "Tipo de teste".
     2. RECUPERAÇÃO: se a T1 já tem alguma tarefa vinculada com tag
        `teste a/b`, pula (execução anterior falhou no meio — só marca
        `teste processado` e segue).
     3. Cria a Tarefa 2 na lista Planejamento com etiqueta `teste a/b`,
        copiando todos os custom fields, nome `[TESTE A/B - {tipo}] {orig}`.
+       Descrição original da T1 vai como COMENTÁRIO (não descrição).
     4. Cria a Tarefa 3 na lista "Testes A/B de Conteúdo" com os mesmos
        campos + "Tipo de teste" preenchido + relacionamento
-       "Planejamento" apontando para T2.
+       "Planejamento" apontando para T2 + "Link do conteúdo Original"
+       preenchido com o Link do Post da T1. Descrição original vai
+       como comentário.
     5. Vincula T1↔T2, T2↔T3, T1↔T3 (link bidirecional do ClickUp).
     6. Adiciona `teste processado` na T1 e remove `executar teste`.
 
-FLUXO 2 — Sincronizar status e data da Tarefa 3
+FLUXO 2 — Sincronizar status, data e link da Tarefa 3
   Varre Tarefas 2 (tag `teste a/b`) em todas as 4 listas do fluxo e
   alinha o status da T3:
     - T2 em Planejamento     → T3 "adicionado ao planejamento"
     - T2 em Copy ou Design   → T3 "em produção"
     - T2 em Agendamentos     → T3 "análise" + due_date = Data da Postagem
+  Também copia T2."Link do Post" → T3."Link do conteúdo teste" quando
+  a T2 já tiver o link preenchido (normalmente acontece quando a
+  variação foi publicada).
   Se a T3 já estiver em "teste completo" ou "inconclusivo" (estados
   terminais), NÃO mexe mais.
+
+Performance
+-----------
+Só considera tarefas atualizadas nos últimos LOOKBACK_MONTHS meses
+(default 6) para não varrer histórico antigo.
 
 Segurança
 ---------
@@ -77,11 +88,15 @@ CF_CLIENTE = "e41a916f-7818-44b6-9e93-fb003f52ad53"
 CF_REDE_SOCIAL = "5293fb4f-2741-4aab-bb1c-518e9e1d2030"
 CF_TIPO = "4fc73c67-8c6e-4e73-ad8e-885df6586260"
 CF_EDITORIAS = "7a155e2e-5b70-467c-894f-98f7f4cc1722"
-CF_LINK_POST_ORIGINAL = "3ee94567-b2f1-4819-91f9-726fcb4378c0"
+CF_LINK_POST = "3ee94567-b2f1-4819-91f9-726fcb4378c0"
 CF_DATA_POSTAGEM = "4ccefbf6-8e46-48af-8f94-1f3eeb8770f6"
 CF_LEGENDA = "322837ee-3eba-41a8-8a5e-82b61fa15366"
 CF_PLANEJAMENTO_REL = "5addfdcc-5182-4547-9d3a-89bd31094118"
 CF_TIPO_TESTE = "273dcb9f-81ee-49bc-b0ec-9ef169bccceb"
+
+# Custom fields só da lista Testes A/B
+CF_T3_LINK_ORIGINAL = "ae83b139-3074-4513-bebf-8283f3f86f45"  # Link do conteúdo Original
+CF_T3_LINK_TESTE = "3e228cd8-a211-4704-8907-4b9d44d76aea"     # Link do conteúdo teste
 
 # Campos copiados T1 → T2 → T3
 COPIABLE_FIELDS = [
@@ -89,12 +104,16 @@ COPIABLE_FIELDS = [
     CF_REDE_SOCIAL,
     CF_TIPO,
     CF_EDITORIAS,
-    CF_LINK_POST_ORIGINAL,
+    CF_LINK_POST,
     CF_DATA_POSTAGEM,
     CF_LEGENDA,
 ]
 
 DROPDOWN_FIELDS = {CF_CLIENTE, CF_REDE_SOCIAL, CF_TIPO, CF_EDITORIAS}
+
+# Janela de busca — só olha tarefas atualizadas nos últimos N meses
+LOOKBACK_MONTHS = 6
+LOOKBACK_MS = LOOKBACK_MONTHS * 30 * 24 * 60 * 60 * 1000  # aproximado
 
 # Status da lista Testes A/B — ClickUp exige minúsculo no PUT
 STATUS_T3_PLANEJAMENTO = "adicionado ao planejamento"
@@ -167,15 +186,19 @@ class ClickUp:
             page += 1
         return out
 
-    def filter_team_tasks(self, list_ids: list[str], tags: list[str]) -> list[dict]:
+    def filter_team_tasks(self, list_ids: list[str], tags: list[str],
+                          date_updated_gt: Optional[int] = None) -> list[dict]:
         """Filtered search via /team/{team_id}/task — muito mais rápido que
         paginar list_tasks inteira quando queremos só tarefas com tag específica.
 
         Tarefas publicadas ficam 'closed'; include_closed=true é obrigatório
-        pois a usuária pode disparar testes em conteúdo já publicado."""
+        pois a usuária pode disparar testes em conteúdo já publicado.
+
+        date_updated_gt (unix ms): se fornecido, só retorna tarefas atualizadas
+        depois desse timestamp. Como a usuária disparar um teste (adicionar tag)
+        conta como update, 6 meses cobre com folga."""
         out: list[dict] = []
         page = 0
-        # requests aceita lista → gera list_ids[]=X&list_ids[]=Y
         params: list[tuple[str, Any]] = [
             ("subtasks", "true"),
             ("include_closed", "true"),
@@ -185,6 +208,8 @@ class ClickUp:
             params.append(("list_ids[]", lid))
         for tag in tags:
             params.append(("tags[]", tag))
+        if date_updated_gt is not None:
+            params.append(("date_updated_gt", date_updated_gt))
 
         while True:
             page_params = params + [("page", page)]
@@ -223,6 +248,11 @@ class ClickUp:
 
     def link_tasks(self, task_id: str, links_to: str) -> None:
         self._req("POST", f"/task/{task_id}/link/{links_to}", write=True)
+
+    def add_comment(self, task_id: str, text: str, notify_all: bool = False) -> None:
+        self._req("POST", f"/task/{task_id}/comment",
+                  json={"comment_text": text, "notify_all": notify_all},
+                  write=True)
 
 
 # ---------------------------------------------------------------------------
@@ -379,21 +409,19 @@ def create_test_pair(cu: ClickUp, t1: dict, tag_ab_ids: set[str]) -> None:
     t2_name = f"[TESTE A/B - {tipo_teste_label}] {t1_name}"
     t3_name = t2_name
 
-    description = (
-        f"Tarefa criada automaticamente a partir de "
-        f"{t1.get('custom_id') or t1_id} — '{t1_name}'.\n\n"
-        f"Tipo de teste: {tipo_teste_label}\n\n"
-        f"{t1.get('text_content') or ''}"
+    # Conteúdo da descrição original — vai como COMENTÁRIO nas T2 e T3,
+    # não como description (a descrição das novas tarefas fica em branco).
+    original_desc = t1.get("text_content") or t1.get("description") or ""
+    comment_text = (
+        f"1) DESCRIÇÃO DA TAREFA ORIGINAL ("
+        f"{t1.get('custom_id') or t1_id}):\n\n{original_desc}"
     )
 
     # --- T2 em Planejamento ---
     # NOTA: tags no payload de create_task são inconsistentemente aplicadas
     # no ClickUp (mesmo bug que custom_fields). Criamos sem tag e adicionamos
     # via endpoint dedicado depois.
-    t2 = cu.create_task(LIST_PLANEJAMENTO, {
-        "name": t2_name,
-        "description": description,
-    })
+    t2 = cu.create_task(LIST_PLANEJAMENTO, {"name": t2_name})
     t2_id = t2["id"]
     log.info("  T2 criada: %s (%s)", t2_id, t2_name)
     try:
@@ -402,15 +430,28 @@ def create_test_pair(cu: ClickUp, t1: dict, tag_ab_ids: set[str]) -> None:
         log.warning("Falha ao adicionar tag 'teste a/b' em T2 %s: %s",
                     t2_id, exc)
     apply_custom_fields(cu, t2_id, t1)
+    try:
+        cu.add_comment(t2_id, comment_text)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Falha ao adicionar comentário em T2 %s: %s", t2_id, exc)
 
     # --- T3 em Testes A/B ---
-    t3 = cu.create_task(LIST_TESTE_AB, {
-        "name": t3_name,
-        "description": description,
-    })
+    t3 = cu.create_task(LIST_TESTE_AB, {"name": t3_name})
     t3_id = t3["id"]
     log.info("  T3 criada: %s (%s)", t3_id, t3_name)
     apply_custom_fields(cu, t3_id, t1, extra_tipo_teste_id=tipo_teste_id)
+    # Preenche "Link do conteúdo Original" na T3 com o Link do Post da T1
+    link_original = cf_value(t1, CF_LINK_POST)
+    if link_original:
+        try:
+            cu.set_custom_field(t3_id, CF_T3_LINK_ORIGINAL, link_original)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Falha ao setar 'Link do conteúdo Original' em T3 %s: %s",
+                        t3_id, exc)
+    try:
+        cu.add_comment(t3_id, comment_text)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Falha ao adicionar comentário em T3 %s: %s", t3_id, exc)
 
     # --- Vínculos ---
     for a, b in [(t1_id, t2_id), (t2_id, t3_id), (t1_id, t3_id)]:
@@ -503,14 +544,26 @@ def _sync_one_t2(cu: ClickUp, t2: dict, kind: str, target_status: str,
                 log.warning("Data Postagem de T2 %s inválida: %r",
                             t2["id"], data_postagem)
 
-    if not payload:
-        return
+    if payload:
+        try:
+            cu.update_task(t3_id, payload)
+            log.info("  T3 %s ← %s", t3_id, payload)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Falha ao atualizar T3 %s: %s", t3_id, exc)
 
-    try:
-        cu.update_task(t3_id, payload)
-        log.info("  T3 %s ← %s", t3_id, payload)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Falha ao atualizar T3 %s: %s", t3_id, exc)
+    # Preenche "Link do conteúdo teste" na T3 se a T2 já tem Link do Post
+    # e a T3 ainda não tem (evita overwrite desnecessário)
+    t2_link = cf_value(t2, CF_LINK_POST)
+    if t2_link:
+        t3_link_atual = cf_value(t3, CF_T3_LINK_TESTE)
+        if t3_link_atual != t2_link:
+            try:
+                cu.set_custom_field(t3_id, CF_T3_LINK_TESTE, t2_link)
+                log.info("  T3 %s 'Link do conteúdo teste' ← %s",
+                         t3_id, t2_link)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Falha ao setar Link do conteúdo teste em T3 %s: %s",
+                            t3_id, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -535,19 +588,23 @@ def main() -> int:
     cu = ClickUp(token, dry_run=dry_run)
 
     try:
-        # Filtered search do ClickUp: só pega tarefas com tag relevante.
-        # Muito mais rápido que paginar listas inteiras (Agendamentos tem 3k+).
-        log.info("Pré-carregando tarefas com filtered search...")
+        # Filtered search do ClickUp: só pega tarefas com tag relevante,
+        # limitado aos últimos N meses (evita varrer histórico antigo).
+        now_ms = int(time.time() * 1000)
+        date_gt = now_ms - LOOKBACK_MS
+        log.info("Pré-carregando tarefas (últimos %d meses)...", LOOKBACK_MONTHS)
 
         # FLUXO 1 candidatas: tag 'executar teste' nas 4 listas
         executar_tasks = cu.filter_team_tasks(
-            list_ids=LISTAS_FLUXO, tags=[TAG_EXECUTAR_TESTE]
+            list_ids=LISTAS_FLUXO, tags=[TAG_EXECUTAR_TESTE],
+            date_updated_gt=date_gt,
         )
         log.info("  Tarefas com 'executar teste': %d", len(executar_tasks))
 
         # FLUXO 2 candidatas: tag 'teste a/b' nas 4 listas
         ab_tasks = cu.filter_team_tasks(
-            list_ids=LISTAS_FLUXO, tags=[TAG_TESTE_AB]
+            list_ids=LISTAS_FLUXO, tags=[TAG_TESTE_AB],
+            date_updated_gt=date_gt,
         )
         log.info("  Tarefas com 'teste a/b' no fluxo: %d", len(ab_tasks))
 
