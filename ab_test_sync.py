@@ -102,8 +102,8 @@ COPIABLE_FIELDS = [
 # Status da lista Testes A/B
 # NOTA: se sua lista tiver nomes diferentes, edite aqui. Os status vistos
 # em tarefas reais foram "adicionado ao planejamento" e "análise".
-STATUS_TESTEAB_EM_PRODUCAO = "EM PRODUÇÃO"
-STATUS_TESTEAB_ANALISE = "ANÁLISE"
+STATUS_TESTEAB_EM_PRODUCAO = "em produção"
+STATUS_TESTEAB_ANALISE = "análise"
 
 # Listas que sinalizam "em produção" na Tarefa 3
 LISTAS_EM_PRODUCAO = {LIST_COPY, LIST_DESIGN}
