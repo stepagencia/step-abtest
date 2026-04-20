@@ -264,13 +264,28 @@ def tag_names(task: dict) -> set[str]:
 # ---------------------------------------------------------------------------
 
 def process_executar_teste(cu: ClickUp) -> None:
-    """Encontra tarefas com 'executar teste' e ainda não processadas."""
-    tasks = cu.list_tasks(LIST_PLANEJAMENTO)
-    candidates = [
-        t for t in tasks
-        if TAG_EXECUTAR_TESTE in tag_names(t)
-        and TAG_TESTE_PROCESSADO not in tag_names(t)
+    """Encontra tarefas com 'executar teste' em qualquer lista do fluxo
+    de conteúdo (Planejamento, Copy, Design, Agendamentos) que ainda
+    não foram processadas.
+
+    A Tarefa 2 (nova variação) é sempre criada na lista Planejamento,
+    independente de onde a Tarefa 1 esteja — afinal, ela precisa percorrer
+    o fluxo de produção do zero.
+    """
+    listas_fluxo = [
+        LIST_PLANEJAMENTO,
+        LIST_COPY,
+        LIST_DESIGN,
+        LIST_AGENDAMENTOS,
     ]
+    candidates: list[dict] = []
+    for list_id in listas_fluxo:
+        tasks = cu.list_tasks(list_id)
+        for t in tasks:
+            if (TAG_EXECUTAR_TESTE in tag_names(t)
+                    and TAG_TESTE_PROCESSADO not in tag_names(t)):
+                candidates.append(t)
+
     log.info("FLUXO 1: %d tarefa(s) a processar", len(candidates))
 
     for t1_summary in candidates:
