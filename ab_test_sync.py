@@ -16,6 +16,10 @@ FLUXO 1 — Detectar novos testes A/B
     3. Cria a Tarefa 2 na lista Planejamento com etiqueta `teste a/b`,
        copiando todos os custom fields, nome `[TESTE A/B - {tipo}] {orig}`.
        Descrição original da T1 vai como COMENTÁRIO (não descrição).
+       A T2 é criada como SUBTAREFA do planejamento-mãe do cliente
+       (task_type Planejamento, presente ou próximo futuro, status
+       não-bloqueado). Se não encontrar planejamento disponível, cria
+       solta e loga aviso.
     4. Cria a Tarefa 3 na lista "Testes A/B de Conteúdo" com os mesmos
        campos + "Tipo de teste" preenchido + relacionamento
        "Planejamento" apontando para T2 + "Link do conteúdo Original"
@@ -57,8 +61,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import time
+from datetime import datetime
 from typing import Any, Optional
 
 import requests
@@ -186,7 +192,9 @@ class ClickUp:
             page += 1
         return out
 
-    def filter_team_tasks(self, list_ids: list[str], tags: list[str],
+    def filter_team_tasks(self, list_ids: list[str],
+                          tags: Optional[list[str]] = None,
+                          custom_items: Optional[list[int]] = None,
                           date_updated_gt: Optional[int] = None) -> list[dict]:
         """Filtered search via /team/{team_id}/task — muito mais rápido que
         paginar list_tasks inteira quando queremos só tarefas com tag específica.
@@ -195,8 +203,9 @@ class ClickUp:
         pois a usuária pode disparar testes em conteúdo já publicado.
 
         date_updated_gt (unix ms): se fornecido, só retorna tarefas atualizadas
-        depois desse timestamp. Como a usuária disparar um teste (adicionar tag)
-        conta como update, 6 meses cobre com folga."""
+        depois desse timestamp.
+        custom_items: lista de IDs numéricos de task type (ex: 1002 para
+        'Planejamento'). Se fornecido, filtra por esses task types."""
         out: list[dict] = []
         page = 0
         params: list[tuple[str, Any]] = [
@@ -206,8 +215,10 @@ class ClickUp:
         ]
         for lid in list_ids:
             params.append(("list_ids[]", lid))
-        for tag in tags:
+        for tag in (tags or []):
             params.append(("tags[]", tag))
+        for ci in (custom_items or []):
+            params.append(("custom_items[]", ci))
         if date_updated_gt is not None:
             params.append(("date_updated_gt", date_updated_gt))
 
@@ -355,12 +366,96 @@ def t1_already_has_variacao(t1: dict, tag_ab_ids: set[str]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Planejamento-mãe — T2 vira subtarefa do planejamento mensal do cliente
+# ---------------------------------------------------------------------------
+
+PLANEJAMENTO_TASK_TYPE_ID = 1002  # custom_item_id do task_type "Planejamento"
+
+# Status que bloqueiam um planejamento-mãe de receber novas subtarefas
+STATUS_PLANEJAMENTO_BLOQUEADOS = {
+    "em produção (já na pauta)",
+    "ativo (vigente)",
+    "concluido",
+}
+
+_MONTH_PT = {
+    "janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3, "abril": 4,
+    "maio": 5, "junho": 6, "julho": 7, "agosto": 8, "setembro": 9,
+    "outubro": 10, "novembro": 11, "dezembro": 12,
+}
+
+
+def parse_planejamento_name(nome: str) -> Optional[tuple[str, int, int]]:
+    """Retorna (cliente, mes, ano) a partir do nome do planejamento, ou None.
+    Padrão esperado: '[Planejamento de Conteúdo] [CLIENTE] [Mês/Ano]'
+    Aceita ano com 2 ou 4 dígitos. Case-insensitive no mês."""
+    # Pega o último [mês/ano]
+    m = re.search(r"\[([^\]/]+)\s*/\s*(\d{2,4})\]\s*$", nome.strip())
+    if not m:
+        return None
+    mes_nome = m.group(1).strip().lower()
+    ano_str = m.group(2)
+    mes_num = _MONTH_PT.get(mes_nome)
+    if not mes_num:
+        return None
+    ano = int(ano_str)
+    if ano < 100:
+        ano += 2000
+
+    # Cliente = penúltimo bloco entre colchetes (o último é o mês/ano)
+    blocos = re.findall(r"\[([^\]]+)\]", nome)
+    if len(blocos) < 2:
+        return None
+    cliente = blocos[-2].strip()
+    return cliente, mes_num, ano
+
+
+def find_planejamento_mae(cliente_nome: str,
+                          planejamentos_cache: list[dict],
+                          now: Optional[datetime] = None) -> Optional[dict]:
+    """Escolhe o planejamento-mãe do cliente:
+      - task_type Planejamento (já filtrado no cache)
+      - cliente bate (case-insensitive)
+      - status NÃO está em STATUS_PLANEJAMENTO_BLOQUEADOS
+      - mês/ano >= mês/ano atual (só presente ou futuro)
+    Retorna o planejamento mais próximo cronologicamente do mês atual.
+    """
+    if not cliente_nome:
+        return None
+    now = now or datetime.now()
+    current_key = (now.year, now.month)
+    cliente_norm = cliente_nome.strip().lower()
+
+    candidates: list[tuple[tuple[int, int], dict]] = []
+    for p in planejamentos_cache:
+        parsed = parse_planejamento_name(p.get("name", ""))
+        if not parsed:
+            continue
+        pcliente, mes, ano = parsed
+        if pcliente.strip().lower() != cliente_norm:
+            continue
+        status = (p.get("status") or {}).get("status", "").strip().lower()
+        if status in STATUS_PLANEJAMENTO_BLOQUEADOS:
+            continue
+        key = (ano, mes)
+        if key < current_key:
+            continue  # passado; ignorar
+        candidates.append((key, p))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])  # mais cedo primeiro
+    return candidates[0][1]
+
+
+# ---------------------------------------------------------------------------
 # FLUXO 1 — cria T2 e T3 a partir de T1
 # ---------------------------------------------------------------------------
 
 def process_executar_teste(cu: ClickUp, tasks_by_list: dict[str, list[dict]],
                            testeab_ids: set[str],
-                           tag_ab_ids: set[str]) -> None:
+                           tag_ab_ids: set[str],
+                           planejamentos_cache: list[dict]) -> None:
     candidates: list[dict] = []
     for list_id in LISTAS_FLUXO:
         for t in tasks_by_list.get(list_id, []):
@@ -376,12 +471,13 @@ def process_executar_teste(cu: ClickUp, tasks_by_list: dict[str, list[dict]],
             # get_task precisa aqui porque o summary de list_tasks nem sempre
             # traz linked_tasks/custom_fields completos
             t1 = cu.get_task(t1_id)
-            create_test_pair(cu, t1, tag_ab_ids)
+            create_test_pair(cu, t1, tag_ab_ids, planejamentos_cache)
         except Exception as exc:  # noqa: BLE001
             log.exception("Falhou ao processar %s: %s", t1_id, exc)
 
 
-def create_test_pair(cu: ClickUp, t1: dict, tag_ab_ids: set[str]) -> None:
+def create_test_pair(cu: ClickUp, t1: dict, tag_ab_ids: set[str],
+                     planejamentos_cache: list[dict]) -> None:
     t1_id = t1["id"]
     t1_name = t1["name"]
 
@@ -417,23 +513,40 @@ def create_test_pair(cu: ClickUp, t1: dict, tag_ab_ids: set[str]) -> None:
         f"{t1.get('custom_id') or t1_id}):\n\n{original_desc}"
     )
 
-    # --- T2 em Planejamento ---
+    # --- Decide o planejamento-mãe da T2 baseado no Cliente da T1 ---
+    cliente_nome = dropdown_option_name(t1, CF_CLIENTE)
+    planejamento_mae = find_planejamento_mae(cliente_nome, planejamentos_cache)
+    t2_payload: dict[str, Any] = {"name": t2_name}
+    if planejamento_mae:
+        t2_payload["parent"] = planejamento_mae["id"]
+        log.info("  Planejamento-mãe escolhido: %s (%s) status=%s",
+                 planejamento_mae.get("custom_id") or planejamento_mae["id"],
+                 planejamento_mae.get("name"),
+                 (planejamento_mae.get("status") or {}).get("status"))
+    else:
+        log.warning("  Nenhum planejamento-mãe disponível pra cliente '%s' "
+                    "(presente/futuro, status OK). T2 será criada solta.",
+                    cliente_nome)
+
+    # --- T2 em Planejamento (como subtarefa se achou planejamento-mãe) ---
     # NOTA: tags no payload de create_task são inconsistentemente aplicadas
-    # no ClickUp (mesmo bug que custom_fields). Criamos sem tag e adicionamos
-    # via endpoint dedicado depois.
-    t2 = cu.create_task(LIST_PLANEJAMENTO, {"name": t2_name})
+    # (bug do ClickUp). Além disso, automações nativas do ClickUp podem
+    # REMOVER tags quando detectam preenchimento de campos. Por isso a tag
+    # é adicionada como ÚLTIMA operação, depois de tudo.
+    t2 = cu.create_task(LIST_PLANEJAMENTO, t2_payload)
     t2_id = t2["id"]
     log.info("  T2 criada: %s (%s)", t2_id, t2_name)
-    try:
-        cu.add_tag(t2_id, TAG_TESTE_AB)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Falha ao adicionar tag 'teste a/b' em T2 %s: %s",
-                    t2_id, exc)
     apply_custom_fields(cu, t2_id, t1)
     try:
         cu.add_comment(t2_id, comment_text)
     except Exception as exc:  # noqa: BLE001
         log.warning("Falha ao adicionar comentário em T2 %s: %s", t2_id, exc)
+    # Tag POR ÚLTIMO — após custom fields para não ser removida por automation
+    try:
+        cu.add_tag(t2_id, TAG_TESTE_AB)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Falha ao adicionar tag 'teste a/b' em T2 %s: %s",
+                    t2_id, exc)
 
     # --- T3 em Testes A/B ---
     t3 = cu.create_task(LIST_TESTE_AB, {"name": t3_name})
@@ -614,6 +727,15 @@ def main() -> int:
         testeab_by_id = {t["id"]: t for t in testeab_tasks}
         log.info("  Lista Testes A/B: %d tarefas", len(testeab_tasks))
 
+        # Planejamentos-mãe (task_type Planejamento) na lista Planejamento
+        # Sem date filter: precisamos enxergar planejamentos futuros que podem
+        # ter sido criados há mais de 6 meses. São poucas tarefas, é rápido.
+        planejamentos_cache = cu.filter_team_tasks(
+            list_ids=[LIST_PLANEJAMENTO],
+            custom_items=[PLANEJAMENTO_TASK_TYPE_ID],
+        )
+        log.info("  Planejamentos-mãe: %d tarefas", len(planejamentos_cache))
+
         # Monta tasks_by_list só com as tarefas relevantes, agrupadas por lista
         tasks_by_list: dict[str, list[dict]] = {lid: [] for lid in LISTAS_FLUXO}
         seen_ids: set[str] = set()
@@ -627,7 +749,8 @@ def main() -> int:
 
         tag_ab_ids = {t["id"] for t in ab_tasks}
 
-        process_executar_teste(cu, tasks_by_list, testeab_ids, tag_ab_ids)
+        process_executar_teste(cu, tasks_by_list, testeab_ids, tag_ab_ids,
+                               planejamentos_cache)
         process_status_sync(cu, tasks_by_list, testeab_ids, testeab_by_id)
     except Exception as exc:  # noqa: BLE001
         log.exception("Erro fatal: %s", exc)
