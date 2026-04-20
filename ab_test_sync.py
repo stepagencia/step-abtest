@@ -104,14 +104,20 @@ CF_TIPO_TESTE = "273dcb9f-81ee-49bc-b0ec-9ef169bccceb"
 CF_T3_LINK_ORIGINAL = "ae83b139-3074-4513-bebf-8283f3f86f45"  # Link do conteúdo Original
 CF_T3_LINK_TESTE = "3e228cd8-a211-4704-8907-4b9d44d76aea"     # Link do conteúdo teste
 
-# Campos copiados T1 → T2 → T3
+# Campos copiados T1 → T2 e T1 → T3 na CRIAÇÃO.
+# Excluídos propositalmente:
+# - Data de Postagem: T2 ainda não tem data (será preenchida quando a
+#   variação for agendada). A T3 recebe via FLUXO 2.
+# - Link do Post: a T2 não deve ter o link do post ORIGINAL (esse é da
+#   T1). Quando a variação for publicada, a Nathalia preenche Link do
+#   Post da T2 com o link da variação, e o FLUXO 2 propaga pra
+#   T3."Link do conteúdo teste". A T3."Link do conteúdo Original" já
+#   é preenchida separadamente no FLUXO 1 (via CF_T3_LINK_ORIGINAL).
 COPIABLE_FIELDS = [
     CF_CLIENTE,
     CF_REDE_SOCIAL,
     CF_TIPO,
     CF_EDITORIAS,
-    CF_LINK_POST,
-    CF_DATA_POSTAGEM,
     CF_LEGENDA,
 ]
 
@@ -387,10 +393,35 @@ _MONTH_PT = {
 
 def parse_planejamento_name(nome: str) -> Optional[tuple[str, int, int]]:
     """Retorna (cliente, mes, ano) a partir do nome do planejamento, ou None.
-    Padrão esperado: '[Planejamento de Conteúdo] [CLIENTE] [Mês/Ano]'
-    Aceita ano com 2 ou 4 dígitos. Case-insensitive no mês."""
-    # Pega o último [mês/ano]
-    m = re.search(r"\[([^\]/]+)\s*/\s*(\d{2,4})\]\s*$", nome.strip())
+
+    Padrão EXATO aceito: '[Planejamento de Conteúdo] [CLIENTE] [Mês/Ano]'
+    Devem ser exatamente 3 blocos entre colchetes, sem nada fora deles
+    (exceto espaços entre blocos). O primeiro bloco deve ser exatamente
+    'Planejamento de Conteúdo' (case-insensitive, espaços toleráveis).
+
+    Isso REJEITA variantes como:
+    - 'Planejamento de Conteúdo [LINKEDIN] [STEP] [Junho/2026]' (tem texto fora)
+    - '[Planejamento de Conteúdo] [LINKEDIN] [STEP] [Junho/2026]' (4 blocos)
+    pois a T2 só deve virar subtarefa do planejamento geral do cliente,
+    não dos específicos por rede social."""
+    nome = nome.strip()
+
+    # Estrutura do nome: só blocos [...] e espaços entre eles
+    if not re.fullmatch(r"(?:\s*\[[^\]]+\]\s*){3}", nome):
+        return None
+
+    blocos = re.findall(r"\[([^\]]+)\]", nome)
+    if len(blocos) != 3:
+        return None
+
+    # Primeiro bloco deve ser exatamente 'Planejamento de Conteúdo'
+    if blocos[0].strip().lower() != "planejamento de conteúdo":
+        return None
+
+    cliente = blocos[1].strip()
+
+    # Último bloco: 'Mês/Ano' (mês em português, ano 2 ou 4 dígitos)
+    m = re.fullmatch(r"\s*([A-Za-zÀ-ÿ]+)\s*/\s*(\d{2,4})\s*", blocos[2])
     if not m:
         return None
     mes_nome = m.group(1).strip().lower()
@@ -402,11 +433,6 @@ def parse_planejamento_name(nome: str) -> Optional[tuple[str, int, int]]:
     if ano < 100:
         ano += 2000
 
-    # Cliente = penúltimo bloco entre colchetes (o último é o mês/ano)
-    blocos = re.findall(r"\[([^\]]+)\]", nome)
-    if len(blocos) < 2:
-        return None
-    cliente = blocos[-2].strip()
     return cliente, mes_num, ano
 
 
@@ -549,8 +575,22 @@ def create_test_pair(cu: ClickUp, t1: dict, tag_ab_ids: set[str],
                     t2_id, exc)
 
     # --- T3 em Testes A/B ---
-    t3 = cu.create_task(LIST_TESTE_AB, {"name": t3_name})
-    t3_id = t3["id"]
+    # Não usamos try/except aqui porque se a criação da T3 falhar, queremos
+    # ABORTAR o par inteiro (não deixa T2 órfã e não marca T1 como processada).
+    # Isso evita a situação em que T2 existe mas não tem T3 correspondente,
+    # quebrando todo o FLUXO 2 de sincronização.
+    try:
+        t3 = cu.create_task(LIST_TESTE_AB, {"name": t3_name})
+    except Exception as exc:  # noqa: BLE001
+        log.error("FALHA ao criar T3 pra T1 %s: %s. T2 %s ficou ÓRFÃ. "
+                  "T1 NÃO será marcada como processada — rode de novo após "
+                  "corrigir o erro.", t1_id, exc, t2_id)
+        return
+    t3_id = (t3 or {}).get("id")
+    if not t3_id:
+        log.error("FALHA: create_task pra T3 não retornou ID. T2 %s ficou "
+                  "ÓRFÃ. T1 %s NÃO marcada como processada.", t2_id, t1_id)
+        return
     log.info("  T3 criada: %s (%s)", t3_id, t3_name)
     apply_custom_fields(cu, t3_id, t1, extra_tipo_teste_id=tipo_teste_id)
     # Preenche "Link do conteúdo Original" na T3 com o Link do Post da T1
@@ -567,11 +607,19 @@ def create_test_pair(cu: ClickUp, t1: dict, tag_ab_ids: set[str],
         log.warning("Falha ao adicionar comentário em T3 %s: %s", t3_id, exc)
 
     # --- Vínculos ---
+    link_failures = 0
     for a, b in [(t1_id, t2_id), (t2_id, t3_id), (t1_id, t3_id)]:
         try:
             cu.link_tasks(a, b)
         except Exception as exc:  # noqa: BLE001
+            link_failures += 1
             log.warning("Falha ao vincular %s ↔ %s: %s", a, b, exc)
+    # Crítico: sem o link T2↔T3 o FLUXO 2 não consegue achar a T3.
+    # Se todos falharem, aborta sem marcar T1 como processada.
+    if link_failures == 3:
+        log.error("FALHA total em criar vínculos. T1 %s NÃO marcada "
+                  "como processada — rode de novo após corrigir.", t1_id)
+        return
 
     # --- Relacionamento T3 → T2 ---
     try:
