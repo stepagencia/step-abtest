@@ -149,12 +149,16 @@ class ClickUp:
     # ----- Leitura -----
 
     def list_tasks(self, list_id: str, **params: Any) -> list[dict]:
-        """Pagina todas as tarefas de uma lista."""
+        """Pagina todas as tarefas de uma lista, incluindo fechadas."""
         out: list[dict] = []
         page = 0
+        # include_closed=true é essencial: tarefas de conteúdo já publicado
+        # podem estar em status "fechado" e ainda precisam virar base de um
+        # teste A/B (você vai testar uma variação contra o post original).
+        base_params = {"subtasks": "true", "include_closed": "true"}
         while True:
             data = self._req("GET", f"/list/{list_id}/task",
-                             params={**params, "page": page, "subtasks": "true"})
+                             params={**base_params, **params, "page": page})
             tasks = data.get("tasks", [])
             out.extend(tasks)
             if len(tasks) < 100:
