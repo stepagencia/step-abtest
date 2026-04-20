@@ -1,0 +1,34 @@
+name: Sync Testes A/B
+
+on:
+  # Roda a cada 5 minutos
+  schedule:
+    - cron: "*/5 * * * *"
+  # Permite rodar manualmente pela UI do GitHub
+  workflow_dispatch:
+
+# Evita duas execuções rodando ao mesmo tempo (protege contra duplicar tarefas)
+concurrency:
+  group: ab-test-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run sync
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: python ab_test_sync.py
