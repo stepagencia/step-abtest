@@ -368,14 +368,24 @@ class T2State:
     linked_t3_id: Optional[str]
 
 
-def find_t3_for_t2(t2: dict) -> Optional[str]:
-    """Encontra a Tarefa 3 vinculada via linked_tasks (qualquer direção)."""
+def find_t3_for_t2(cu: "ClickUp", t2: dict) -> Optional[str]:
+    """Encontra a Tarefa 3 vinculada via linked_tasks, mas SÓ retorna se
+    a candidata estiver de fato na lista Testes A/B. Isso evita confundir
+    tarefas com etiqueta 'teste a/b' que não são Tarefas 2 de verdade
+    (tarefas-pai de planejamento, etc.) com testes reais.
+    """
     for link in t2.get("linked_tasks", []):
-        candidate = link.get("task_id") or link.get("link_id")
-        if candidate and candidate != t2["id"]:
-            # A Tarefa 3 mora na lista de Teste A/B; vamos checar.
-            # Evita busca extra: linked_tasks pode ter só o id.
-            return candidate
+        candidate_id = link.get("task_id") or link.get("link_id")
+        if not candidate_id or candidate_id == t2["id"]:
+            continue
+        # Busca a candidata pra confirmar que está na lista Testes A/B
+        try:
+            candidate = cu.get_task(candidate_id)
+            candidate_list = candidate.get("list", {}).get("id")
+            if candidate_list == LIST_TESTE_AB:
+                return candidate_id
+        except Exception:  # noqa: BLE001
+            continue
     return None
 
 
@@ -393,14 +403,15 @@ def process_status_sync(cu: ClickUp) -> None:
         t2s = [t for t in tasks if TAG_TESTE_AB in tag_names(t)]
         if not t2s:
             continue
-        log.info("FLUXO 2: lista %s → %d Tarefa(s) 2", list_id, len(t2s))
+        log.info("FLUXO 2: lista %s → %d candidata(s) com tag 'teste a/b'",
+                 list_id, len(t2s))
 
         for t2_summary in t2s:
             t2 = cu.get_task(t2_summary["id"])
-            t3_id = find_t3_for_t2(t2)
+            t3_id = find_t3_for_t2(cu, t2)
             if not t3_id:
-                log.warning("  Tarefa 2 %s não tem Tarefa 3 vinculada; pulando",
-                            t2["id"])
+                # Sem T3 na lista Testes A/B = não é Tarefa 2 de verdade,
+                # é só uma tarefa com a etiqueta por outro motivo. Pula em silêncio.
                 continue
             data_postagem = cf_value(t2, CF_DATA_POSTAGEM)
 
