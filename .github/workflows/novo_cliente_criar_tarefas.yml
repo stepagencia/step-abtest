@@ -2,8 +2,21 @@ name: Novo cliente — criar tarefas automáticas
 
 on:
   schedule:
-    - cron: "0 9 * * *"  # Roda todo dia às 9h UTC (10h em Londres no verão)
+    - cron: "0 9 * * *"  # Roda todo dia às 9h UTC (6h SP)
   workflow_dispatch:       # Permite rodar manualmente pelo GitHub
+    inputs:
+      dry_run:
+        description: "Rodar em modo DRY_RUN (só loga, não escreve)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      limit:
+        description: "LIMIT: processa só os N primeiros especialistas (vazio = todos)"
+        required: false
+        default: ""
 
 jobs:
   automation:
@@ -25,4 +38,6 @@ jobs:
         env:
           CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
           CLICKUP_PLANEJAMENTO_LIST_ID: ${{ secrets.CLICKUP_PLANEJAMENTO_LIST_ID }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          LIMIT: ${{ github.event.inputs.limit || '' }}
         run: python novo_cliente_criar_tarefas.py
